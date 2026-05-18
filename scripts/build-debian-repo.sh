@@ -176,7 +176,10 @@ done
 mapfile -t all_arches < <(printf '%s\n' "${!arch_seen[@]}" | sort)
 
 all_packages="${tmp_dir}/Packages.all"
-apt-ftparchive packages "${pool_dir}" > "${all_packages}"
+(
+  cd "${SITE_DIR}"
+  apt-ftparchive packages "pool/${APT_COMPONENT}"
+) > "${all_packages}"
 
 for arch in "${all_arches[@]}"; do
   binary_dir="${component_root}/binary-${arch}"

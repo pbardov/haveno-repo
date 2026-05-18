@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_OWNER="${SOURCE_OWNER:-retoaccess1}"
+SOURCE_REPO="${SOURCE_REPO:-haveno-reto}"
+SITE_DIR="${SITE_DIR:-site}"
+APT_DIST="${APT_DIST:-stable}"
+APT_COMPONENT="${APT_COMPONENT:-main}"
+APT_ORIGIN="${APT_ORIGIN:-Haveno Reto}"
+APT_LABEL="${APT_LABEL:-Haveno Reto}"
+APT_DESCRIPTION="${APT_DESCRIPTION:-Debian repository for Haveno Reto releases}"
+api_base="https://api.github.com/repos/${SOURCE_OWNER}/${SOURCE_REPO}"
+release_api="${api_base}/releases"
+
+pool_dir="${SITE_DIR}/pool/${APT_COMPONENT}"
+dist_root="${SITE_DIR}/dists/${APT_DIST}"
+component_root="${dist_root}/${APT_COMPONENT}"
+tmp_dir="$(mktemp -d)"
+assets_tsv="${tmp_dir}/assets.tsv"
+
+token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+api_headers=(
+  -H "Accept: application/vnd.github+json"
+  -H "X-GitHub-Api-Version: 2022-11-28"
+)
+if [[ -n "${token}" ]]; then
+  api_headers+=(-H "Authorization: Bearer ${token}")
+fi
+
+cleanup() {
+  rm -rf "${tmp_dir}"
+}
+trap cleanup EXIT
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+require_cmd curl
+require_cmd jq
+require_cmd dpkg-deb
+require_cmd apt-ftparchive
+require_cmd gzip
+
+mkdir -p "${pool_dir}" "${component_root}"
+: > "${assets_tsv}"
+
+echo "Fetching release metadata from ${SOURCE_OWNER}/${SOURCE_REPO}..."
+
+page=1
+declare -A seen_names=()
+
+while :; do
+  page_json="$(
+    curl -fsSL \
+      "${api_headers[@]}" \
+      "${release_api}?per_page=100&page=${page}"
+  )"
+
+  page_count="$(jq 'length' <<<"${page_json}")"
+  if [[ "${page_count}" == "0" ]]; then
+    break
+  fi
+
+  while IFS=$'\t' read -r release_tag asset_name asset_url; do
+    if [[ -z "${asset_name}" || -z "${asset_url}" ]]; then
+      continue
+    fi
+    if [[ -n "${seen_names[${asset_name}]+x}" ]]; then
+      continue
+    fi
+    seen_names["${asset_name}"]=1
+    printf '%s\t%s\t%s\n' "${release_tag}" "${asset_name}" "${asset_url}" >> "${assets_tsv}"
+  done < <(
+    jq -r '
+      .[]
+      | select((.draft | not) and (.prerelease | not))
+      | .tag_name as $tag
+      | .assets[]
+      | select(.name | endswith(".deb"))
+      | [$tag, .name, .browser_download_url]
+      | @tsv
+    ' <<<"${page_json}"
+  )
+
+  page=$((page + 1))
+done
+
+asset_count="$(wc -l < "${assets_tsv}" | tr -d ' ')"
+if [[ "${asset_count}" == "0" ]]; then
+  echo "No .deb assets found in ${SOURCE_OWNER}/${SOURCE_REPO} releases." >&2
+  exit 1
+fi
+
+echo "Downloading ${asset_count} Debian packages..."
+while IFS=$'\t' read -r release_tag asset_name asset_url; do
+  target="${pool_dir}/${asset_name}"
+  if [[ -f "${target}" ]]; then
+    continue
+  fi
+
+  echo "  - ${asset_name} (${release_tag})"
+  curl -fsSL --retry 3 --retry-delay 2 -o "${target}" "${asset_url}"
+done < "${assets_tsv}"
+
+mapfile -t deb_files < <(find "${pool_dir}" -maxdepth 1 -type f -name '*.deb' | sort)
+if [[ "${#deb_files[@]}" -eq 0 ]]; then
+  echo "No downloaded .deb files found in ${pool_dir}." >&2
+  exit 1
+fi
+
+declare -A arch_seen=()
+for deb_file in "${deb_files[@]}"; do
+  arch="$(dpkg-deb -f "${deb_file}" Architecture | tr -d '\n')"
+  if [[ -z "${arch}" ]]; then
+    echo "Unable to detect package architecture for ${deb_file}" >&2
+    exit 1
+  fi
+  arch_seen["${arch}"]=1
+done
+
+mapfile -t all_arches < <(printf '%s\n' "${!arch_seen[@]}" | sort)
+
+for arch in "${all_arches[@]}"; do
+  binary_dir="${component_root}/binary-${arch}"
+  mkdir -p "${binary_dir}"
+  apt-ftparchive -a "${arch}" packages "${pool_dir}" > "${binary_dir}/Packages"
+  gzip -9c "${binary_dir}/Packages" > "${binary_dir}/Packages.gz"
+done
+
+release_arches=()
+for arch in "${all_arches[@]}"; do
+  if [[ "${arch}" != "all" ]]; then
+    release_arches+=("${arch}")
+  fi
+done
+if [[ "${#release_arches[@]}" -eq 0 ]]; then
+  release_arches=("all")
+fi
+if [[ -n "${arch_seen[all]+x}" ]]; then
+  release_arches+=("all")
+fi
+
+mapfile -t release_arches < <(printf '%s\n' "${release_arches[@]}" | awk 'NF && !seen[$0]++')
+release_arches_str="$(printf '%s ' "${release_arches[@]}" | sed 's/[[:space:]]*$//')"
+
+apt_conf="${tmp_dir}/apt-ftparchive-release.conf"
+cat > "${apt_conf}" <<EOF
+APT::FTPArchive::Release {
+  Origin "${APT_ORIGIN}";
+  Label "${APT_LABEL}";
+  Suite "${APT_DIST}";
+  Codename "${APT_DIST}";
+  Architectures "${release_arches_str}";
+  Components "${APT_COMPONENT}";
+  Description "${APT_DESCRIPTION}";
+};
+EOF
+
+apt-ftparchive -c "${apt_conf}" release "${dist_root}" > "${dist_root}/Release"
+
+cat > "${SITE_DIR}/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Haveno Reto Debian Repository</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+  <h1>Haveno Reto Debian Repository</h1>
+  <p>Repository source: <a href="https://github.com/${SOURCE_OWNER}/${SOURCE_REPO}/releases">${SOURCE_OWNER}/${SOURCE_REPO} releases</a></p>
+  <p>Distribution: <code>${APT_DIST}</code>, Component: <code>${APT_COMPONENT}</code></p>
+  <p>Generated at: <code>$(date -u +"%Y-%m-%dT%H:%M:%SZ")</code></p>
+</body>
+</html>
+EOF
+
+echo "Done. Repository generated under ${SITE_DIR}/"

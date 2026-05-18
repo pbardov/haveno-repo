@@ -9,6 +9,10 @@ APT_COMPONENT="${APT_COMPONENT:-main}"
 APT_ORIGIN="${APT_ORIGIN:-Haveno Reto}"
 APT_LABEL="${APT_LABEL:-Haveno Reto}"
 APT_DESCRIPTION="${APT_DESCRIPTION:-Debian repository for Haveno Reto releases}"
+SIGN_REPO="${SIGN_REPO:-false}"
+APT_SIGNING_KEY_ID="${APT_SIGNING_KEY_ID:-}"
+APT_SIGNING_PASSPHRASE="${APT_SIGNING_PASSPHRASE:-}"
+APT_SIGNING_KEYRING_FILENAME="${APT_SIGNING_KEYRING_FILENAME:-haveno-repo-archive-keyring.gpg}"
 api_base="https://api.github.com/repos/${SOURCE_OWNER}/${SOURCE_REPO}"
 release_api="${api_base}/releases"
 
@@ -39,11 +43,21 @@ require_cmd() {
   fi
 }
 
+is_true() {
+  case "$1" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 require_cmd curl
 require_cmd jq
 require_cmd dpkg-deb
 require_cmd apt-ftparchive
 require_cmd gzip
+if is_true "${SIGN_REPO}"; then
+  require_cmd gpg
+fi
 
 mkdir -p "${pool_dir}" "${component_root}"
 : > "${assets_tsv}"
@@ -232,6 +246,40 @@ EOF
 
 apt-ftparchive -c "${apt_conf}" release "${dist_root}" > "${dist_root}/Release"
 
+if is_true "${SIGN_REPO}"; then
+  if [[ -z "${APT_SIGNING_KEY_ID}" ]]; then
+    echo "SIGN_REPO is enabled, but APT_SIGNING_KEY_ID is empty." >&2
+    exit 1
+  fi
+
+  keyring_path="${SITE_DIR}/${APT_SIGNING_KEYRING_FILENAME}"
+  gpg --batch --yes --output "${keyring_path}" --export "${APT_SIGNING_KEY_ID}"
+
+  gpg_sign_args=(
+    --batch
+    --yes
+    --pinentry-mode
+    loopback
+    --local-user
+    "${APT_SIGNING_KEY_ID}"
+  )
+  rm -f "${dist_root}/InRelease" "${dist_root}/Release.gpg"
+  if [[ -n "${APT_SIGNING_PASSPHRASE}" ]]; then
+    gpg_sign_args+=(--passphrase-fd 0)
+    printf '%s' "${APT_SIGNING_PASSPHRASE}" | gpg "${gpg_sign_args[@]}" --output "${dist_root}/InRelease" --clearsign "${dist_root}/Release"
+    printf '%s' "${APT_SIGNING_PASSPHRASE}" | gpg "${gpg_sign_args[@]}" --output "${dist_root}/Release.gpg" --detach-sign "${dist_root}/Release"
+  else
+    gpg "${gpg_sign_args[@]}" --output "${dist_root}/InRelease" --clearsign "${dist_root}/Release"
+    gpg "${gpg_sign_args[@]}" --output "${dist_root}/Release.gpg" --detach-sign "${dist_root}/Release"
+  fi
+fi
+
+if is_true "${SIGN_REPO}"; then
+  repo_key_line="<p>Repository key: <a href=\"./${APT_SIGNING_KEYRING_FILENAME}\">${APT_SIGNING_KEYRING_FILENAME}</a></p>"
+else
+  repo_key_line="<p>Repository key: <code>not configured</code></p>"
+fi
+
 cat > "${SITE_DIR}/index.html" <<EOF
 <!doctype html>
 <html lang="en">
@@ -244,6 +292,7 @@ cat > "${SITE_DIR}/index.html" <<EOF
   <h1>Haveno Reto Debian Repository</h1>
   <p>Repository source: <a href="https://github.com/${SOURCE_OWNER}/${SOURCE_REPO}/releases">${SOURCE_OWNER}/${SOURCE_REPO} releases</a></p>
   <p>Distribution: <code>${APT_DIST}</code>, Component: <code>${APT_COMPONENT}</code></p>
+  ${repo_key_line}
   <p>Generated at: <code>$(date -u +"%Y-%m-%dT%H:%M:%SZ")</code></p>
 </body>
 </html>

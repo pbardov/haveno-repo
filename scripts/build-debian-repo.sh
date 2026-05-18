@@ -124,10 +124,43 @@ done
 
 mapfile -t all_arches < <(printf '%s\n' "${!arch_seen[@]}" | sort)
 
+all_packages="${tmp_dir}/Packages.all"
+apt-ftparchive packages "${pool_dir}" > "${all_packages}"
+
 for arch in "${all_arches[@]}"; do
   binary_dir="${component_root}/binary-${arch}"
   mkdir -p "${binary_dir}"
-  apt-ftparchive -a "${arch}" packages "${pool_dir}" > "${binary_dir}/Packages"
+
+  awk -v target_arch="${arch}" '
+    BEGIN {
+      RS = "";
+      ORS = "\n\n";
+    }
+    {
+      pkg_arch = "";
+      line_count = split($0, lines, "\n");
+      for (i = 1; i <= line_count; i++) {
+        if (index(lines[i], "Architecture: ") == 1) {
+          pkg_arch = substr(lines[i], 15);
+          break;
+        }
+      }
+      if (pkg_arch == "") {
+        next;
+      }
+
+      if (target_arch == "all") {
+        if (pkg_arch == "all") {
+          print $0;
+        }
+      } else {
+        if (pkg_arch == target_arch || pkg_arch == "all") {
+          print $0;
+        }
+      }
+    }
+  ' "${all_packages}" > "${binary_dir}/Packages"
+
   gzip -9c "${binary_dir}/Packages" > "${binary_dir}/Packages.gz"
 done
 

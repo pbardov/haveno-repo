@@ -14,7 +14,7 @@ on:
       - "README.md"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -28,11 +28,36 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y apt-utils jq
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Prepare site-upload branch
+        env:
+          SITE_UPLOAD_BRANCH: site-upload
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --heads origin "refs/heads/${SITE_UPLOAD_BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${SITE_UPLOAD_BRANCH}"
+            git checkout -B "${SITE_UPLOAD_BRANCH}" "origin/${SITE_UPLOAD_BRANCH}"
+            git merge --no-edit "${GITHUB_SHA}"
+          else
+            git checkout -B "${SITE_UPLOAD_BRANCH}" "${GITHUB_SHA}"
+          fi
+
+          if [[ -f .gitignore ]]; then
+            sed -i '/^site\/$/d' .gitignore
+          fi
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -48,6 +73,21 @@ jobs:
         run: |
           chmod +x scripts/build-debian-repo.sh
           scripts/build-debian-repo.sh
+
+      - name: Commit and push site-upload updates
+        env:
+          SITE_UPLOAD_BRANCH: site-upload
+        run: |
+          set -euo pipefail
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Debian repo snapshot from ${GITHUB_SHA::7}"
+          else
+            echo "No file changes to commit."
+          fi
+
+          git push origin "${SITE_UPLOAD_BRANCH}"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4

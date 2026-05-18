@@ -65,7 +65,7 @@ while :; do
     break
   fi
 
-  while IFS=$'\t' read -r release_tag asset_name asset_url; do
+  while IFS=$'\t' read -r release_tag asset_name asset_url asset_size; do
     if [[ -z "${asset_name}" || -z "${asset_url}" ]]; then
       continue
     fi
@@ -73,7 +73,7 @@ while :; do
       continue
     fi
     seen_names["${asset_name}"]=1
-    printf '%s\t%s\t%s\n' "${release_tag}" "${asset_name}" "${asset_url}" >> "${assets_tsv}"
+    printf '%s\t%s\t%s\t%s\n' "${release_tag}" "${asset_name}" "${asset_url}" "${asset_size}" >> "${assets_tsv}"
   done < <(
     jq -r '
       .[]
@@ -81,7 +81,7 @@ while :; do
       | .tag_name as $tag
       | .assets[]
       | select(.name | endswith(".deb"))
-      | [$tag, .name, .browser_download_url]
+      | [$tag, .name, .browser_download_url, (.size | tostring)]
       | @tsv
     ' <<<"${page_json}"
   )
@@ -96,14 +96,51 @@ if [[ "${asset_count}" == "0" ]]; then
 fi
 
 echo "Downloading ${asset_count} Debian packages..."
-while IFS=$'\t' read -r release_tag asset_name asset_url; do
+declare -A wanted_assets=()
+while IFS=$'\t' read -r _release_tag asset_name _asset_url _asset_size; do
+  wanted_assets["${asset_name}"]=1
+done < "${assets_tsv}"
+
+while IFS= read -r existing_deb; do
+  [[ -z "${existing_deb}" ]] && continue
+  base_name="$(basename "${existing_deb}")"
+  if [[ -z "${wanted_assets[${base_name}]+x}" ]]; then
+    echo "  - Removing obsolete package: ${base_name}"
+    rm -f "${existing_deb}"
+  fi
+done < <(find "${pool_dir}" -maxdepth 1 -type f -name '*.deb')
+
+while IFS=$'\t' read -r release_tag asset_name asset_url asset_size; do
   target="${pool_dir}/${asset_name}"
+  expected_size="${asset_size:-0}"
+
   if [[ -f "${target}" ]]; then
-    continue
+    actual_size="$(stat -c%s "${target}")"
+    if [[ "${expected_size}" != "0" && "${actual_size}" != "${expected_size}" ]]; then
+      echo "  - Size mismatch for ${asset_name}, re-downloading"
+      rm -f "${target}"
+    elif ! dpkg-deb -f "${target}" Package >/dev/null 2>&1; then
+      echo "  - Corrupted package ${asset_name}, re-downloading"
+      rm -f "${target}"
+    else
+      continue
+    fi
   fi
 
   echo "  - ${asset_name} (${release_tag})"
-  curl -fsSL --retry 3 --retry-delay 2 -o "${target}" "${asset_url}"
+  tmp_target="${target}.tmp"
+  rm -f "${tmp_target}"
+  curl -fsSL --retry 3 --retry-delay 2 -o "${tmp_target}" "${asset_url}"
+  dpkg-deb -f "${tmp_target}" Package >/dev/null 2>&1
+  if [[ "${expected_size}" != "0" ]]; then
+    downloaded_size="$(stat -c%s "${tmp_target}")"
+    if [[ "${downloaded_size}" != "${expected_size}" ]]; then
+      echo "Downloaded file size mismatch for ${asset_name}: expected ${expected_size}, got ${downloaded_size}" >&2
+      rm -f "${tmp_target}"
+      exit 1
+    fi
+  fi
+  mv "${tmp_target}" "${target}"
 done < "${assets_tsv}"
 
 mapfile -t deb_files < <(find "${pool_dir}" -maxdepth 1 -type f -name '*.deb' | sort)

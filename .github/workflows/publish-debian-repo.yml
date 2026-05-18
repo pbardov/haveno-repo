@@ -14,7 +14,7 @@ on:
       - "README.md"
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
@@ -28,36 +28,72 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y apt-utils jq
 
-      - name: Configure Git author
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Prepare site-upload branch
+      - name: Compute Debian assets fingerprint
+        id: deb_assets
         env:
-          SITE_UPLOAD_BRANCH: site-upload
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_OWNER: retoaccess1
+          SOURCE_REPO: haveno-reto
         run: |
           set -euo pipefail
 
-          if git ls-remote --exit-code --heads origin "refs/heads/${SITE_UPLOAD_BRANCH}" >/dev/null 2>&1; then
-            git fetch origin "${SITE_UPLOAD_BRANCH}"
-            git checkout -B "${SITE_UPLOAD_BRANCH}" "origin/${SITE_UPLOAD_BRANCH}"
-            git merge --no-edit "${GITHUB_SHA}"
-          else
-            git checkout -B "${SITE_UPLOAD_BRANCH}" "${GITHUB_SHA}"
+          api_base="https://api.github.com/repos/${SOURCE_OWNER}/${SOURCE_REPO}/releases"
+          headers=(
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+          if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+            headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
           fi
 
-          if [[ -f .gitignore ]]; then
-            sed -i '/^site\/$/d' .gitignore
+          manifest="$(mktemp)"
+          : > "${manifest}"
+
+          page=1
+          while :; do
+            page_json="$(curl -fsSL "${headers[@]}" "${api_base}?per_page=100&page=${page}")"
+            page_count="$(jq 'length' <<<"${page_json}")"
+            if [[ "${page_count}" == "0" ]]; then
+              break
+            fi
+
+            jq -r '
+              .[]
+              | select((.draft | not) and (.prerelease | not))
+              | .assets[]
+              | select(.name | endswith(".deb"))
+              | [.name, (.size | tostring), .updated_at]
+              | @tsv
+            ' <<<"${page_json}" >> "${manifest}"
+
+            page=$((page + 1))
+          done
+
+          sort -u "${manifest}" -o "${manifest}"
+          asset_count="$(wc -l < "${manifest}" | tr -d " ")"
+          if [[ "${asset_count}" == "0" ]]; then
+            echo "No .deb assets found." >&2
+            exit 1
           fi
+          hash="$(sha256sum "${manifest}" | awk '{print $1}')"
+
+          echo "asset_count=${asset_count}" >> "${GITHUB_OUTPUT}"
+          echo "hash=${hash}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore Debian package cache
+        id: deb_cache
+        uses: actions/cache@v4
+        with:
+          path: site/pool/main
+          key: deb-pool-${{ runner.os }}-${{ steps.deb_assets.outputs.hash }}
+          restore-keys: |
+            deb-pool-${{ runner.os }}-
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -73,21 +109,6 @@ jobs:
         run: |
           chmod +x scripts/build-debian-repo.sh
           scripts/build-debian-repo.sh
-
-      - name: Commit and push site-upload updates
-        env:
-          SITE_UPLOAD_BRANCH: site-upload
-        run: |
-          set -euo pipefail
-
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "Update Debian repo snapshot from ${GITHUB_SHA::7}"
-          else
-            echo "No file changes to commit."
-          fi
-
-          git push origin "${SITE_UPLOAD_BRANCH}"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
